@@ -3,16 +3,24 @@ name = "network"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 bytes = "1.4.0"
 chrono = "0.4.26"
 futures = "0.3.28"
+futures-util = "0.3.28"
 rand = "0.8.5"
+uuid = { version = "1.4.1", features = ["v4"] }
+dashmap = "5.5.3"
+thiserror = "1.0"
+socket2 = "0.5"
+
+# Async runtime and networking
+tokio = { version = "1.32", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "time"] }
+
+# Existing local dependencies
 api = { path = '../api' }
 crypto = { path = '../crypto' }
 logger = { path = '../logger' }
 spmc = "0.3.0"
 store = { path = '../store' }
-uuid = { version = "1.4.1", features = ["v4"] }

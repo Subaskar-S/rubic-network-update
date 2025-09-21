@@ -66,10 +66,9 @@ pub fn maintain_peers(peer_set: Arc<Mutex<PeerSet>>) {
                 let mut ids_to_delete: Vec<String>  = Vec::with_capacity(num_to_disconnect);
 
                 {
-                    for (index, peer) in peer_set.lock().unwrap().get_peers().iter().enumerate() {
-                        let id = peer.get_id().clone();
+                    for (index, peer_id) in peer_set.lock().unwrap().get_peer_ids().iter().enumerate() {
                         if index < num_to_disconnect {
-                            ids_to_delete.push(id);
+                            ids_to_delete.push(peer_id.clone());
                         }
                     }
                 }

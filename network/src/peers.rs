@@ -1,238 +1,416 @@
-use std::io::prelude::*;
-use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
-use api::request::QubicApiPacket;
-use logger::{ debug, error };
-use std::time::{Duration};
+use dashmap::DashMap;
 use rand::prelude::IteratorRandom;
 use rand::thread_rng;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio::time::interval;
+
+use api::header::EntityType;
+use api::request::QubicApiPacket;
+use logger::debug;
 use store;
 
-use crate::worker;
-use crate::peer::Peer;
+use crate::connection_pool::{ConnectionPool, PoolConfig};
+use crate::error::{NetworkError, NetworkResult};
+use crate::peer::{AsyncPeer, PeerStats};
+use crate::worker::AsyncWorkerManager;
 
-
-pub struct PeerSet {
-  peers: Vec<Peer>,
-  req_channel: (spmc::Sender<QubicApiPacket>, spmc::Receiver<QubicApiPacket>),
-  request_matcher: Arc<Mutex<HashMap<u32, QubicApiPacket>>>,
-  threads: HashMap<String, std::thread::JoinHandle<()>>
+#[derive(Debug, Clone)]
+pub enum LoadBalancingStrategy {
+    RoundRobin,
+    Random,
+    LeastConnections,
+    ScoreBased,
 }
 
+#[derive(Debug, Clone)]
+pub struct PeerSetConfig {
+    pub max_peers: usize,
+    pub connection_timeout: Duration,
+    pub health_check_interval: Duration,
+    pub load_balancing: LoadBalancingStrategy,
+    pub enable_connection_pooling: bool,
+    pub pool_config: PoolConfig,
+}
 
+impl Default for PeerSetConfig {
+    fn default() -> Self {
+        Self {
+            max_peers: 50,
+            connection_timeout: Duration::from_secs(5),
+            health_check_interval: Duration::from_secs(30),
+            load_balancing: LoadBalancingStrategy::ScoreBased,
+            enable_connection_pooling: true,
+            pool_config: PoolConfig::default(),
+        }
+    }
+}
 
+pub struct AsyncPeerSet {
+    peers: Arc<DashMap<String, AsyncPeer>>,
+    addr_to_id: Arc<DashMap<SocketAddr, String>>,
+    connection_pool: Arc<ConnectionPool>,
+    worker_manager: Arc<AsyncWorkerManager>,
+    config: PeerSetConfig,
+    round_robin_counter: AtomicU32,
+    request_sender: broadcast::Sender<QubicApiPacket>,
+    _request_receiver: broadcast::Receiver<QubicApiPacket>,
+}
+
+impl AsyncPeerSet {
+    pub fn new(config: PeerSetConfig) -> Self {
+        let connection_pool = Arc::new(ConnectionPool::new(config.pool_config.clone()));
+        let worker_manager = Arc::new(AsyncWorkerManager::new(Arc::clone(&connection_pool)));
+        let (request_sender, request_receiver) = broadcast::channel(1000);
+
+        Self {
+            peers: Arc::new(DashMap::new()),
+            addr_to_id: Arc::new(DashMap::new()),
+            connection_pool,
+            worker_manager,
+            config,
+            round_robin_counter: AtomicU32::new(0),
+            request_sender,
+            _request_receiver: request_receiver,
+        }
+    }
+
+    pub async fn add_peer(&self, addr: SocketAddr, nick: &str) -> NetworkResult<String> {
+        // Check peer limit
+        if self.peers.len() >= self.config.max_peers {
+            return Err(NetworkError::PeerLimitReached);
+        }
+
+        // Check if peer already exists
+        if self.addr_to_id.contains_key(&addr) {
+            return Err(NetworkError::ConnectionFailed(
+                "Peer already exists".to_string(),
+            ));
+        }
+
+        // Create new async peer
+        let peer = AsyncPeer::new(addr, nick, Arc::clone(&self.connection_pool)).await?;
+        let peer_id = peer.get_id().to_string();
+
+        // Test connection
+        if !peer.health_check().await {
+            return Err(NetworkError::ConnectionFailed(format!(
+                "Failed to connect to {}",
+                addr
+            )));
+        }
+
+        // Store peer
+        self.addr_to_id.insert(addr, peer_id.clone());
+        self.peers.insert(peer_id.clone(), peer.clone());
+
+        // Start worker for this peer
+        self.worker_manager
+            .start_worker(&peer_id, peer, self.request_sender.subscribe())
+            .await;
+
+        // Update database
+        match store::sqlite::peer::set_peer_connected(store::get_db_path().as_str(), &peer_id) {
+            Ok(_) => debug(&format!("Added and connected peer: {}", peer_id)),
+            Err(err) => debug(&format!("Error updating peer status: {}", err)),
+        }
+
+        Ok(peer_id)
+    }
+
+    pub async fn get_peer_ids(&self) -> Vec<String> {
+        self.peers.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    pub async fn remove_peer(&self, peer_id: &str) -> bool {
+        if let Some((_, peer)) = self.peers.remove(peer_id) {
+            // Remove from address mapping
+            self.addr_to_id.remove(&peer.get_addr());
+
+            // Stop worker
+            self.worker_manager.stop_worker(peer_id).await;
+
+            // Update database
+            let _ =
+                store::sqlite::peer::set_peer_disconnected(store::get_db_path().as_str(), peer_id);
+
+            debug(&format!("Removed peer: {}", peer_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn remove_peer_by_addr(&self, addr: SocketAddr) -> bool {
+        if let Some((_, peer_id)) = self.addr_to_id.remove(&addr) {
+            self.remove_peer(&peer_id).await
+        } else {
+            false
+        }
+    }
+
+    pub async fn make_request(&self, request: QubicApiPacket) -> NetworkResult<()> {
+        if self.peers.is_empty() {
+            return Err(NetworkError::ConnectionFailed(
+                "No peers available".to_string(),
+            ));
+        }
+
+        // Determine if we should broadcast to all peers or use load balancing
+        let broadcast_all = matches!(
+            request.api_type,
+            EntityType::RequestCurrentTickInfo
+                | EntityType::RequestedQuorumTick
+                | EntityType::RequestTickData
+                | EntityType::RequestContractFunction
+                | EntityType::RequestAssets
+        );
+
+        if broadcast_all {
+            // Broadcast to all connected peers
+            let _ = self.request_sender.send(request);
+        } else {
+            // Use load balancing to select optimal peer
+            if let Some(selected_peer) = self.select_peer_for_request().await {
+                let mut targeted_request = request;
+                targeted_request.peer = Some(selected_peer.get_id().to_string());
+                let _ = self.request_sender.send(targeted_request);
+            } else {
+                return Err(NetworkError::ConnectionFailed(
+                    "No healthy peers available".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn select_peer_for_request(&self) -> Option<AsyncPeer> {
+        let connected_peers: Vec<AsyncPeer> = self
+            .peers
+            .iter()
+            .filter(|entry| entry.value().is_connected())
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        if connected_peers.is_empty() {
+            return None;
+        }
+
+        match self.config.load_balancing {
+            LoadBalancingStrategy::Random => connected_peers.into_iter().choose(&mut thread_rng()),
+            LoadBalancingStrategy::RoundRobin => {
+                let index = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                connected_peers.get(index % connected_peers.len()).cloned()
+            }
+            LoadBalancingStrategy::LeastConnections => {
+                // For now, just return random - would need connection count tracking
+                connected_peers.into_iter().choose(&mut thread_rng())
+            }
+            LoadBalancingStrategy::ScoreBased => {
+                let mut best_peer: Option<AsyncPeer> = None;
+                let mut best_score = 0.0;
+
+                for peer in connected_peers {
+                    let score = peer.calculate_score().await;
+                    if score > best_score {
+                        best_score = score;
+                        best_peer = Some(peer);
+                    }
+                }
+
+                best_peer
+            }
+        }
+    }
+
+    pub fn get_peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn get_connected_peer_count(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|entry| entry.value().is_connected())
+            .count()
+    }
+
+    pub async fn get_peer_stats(&self) -> HashMap<String, PeerStats> {
+        let mut stats = HashMap::new();
+        for entry in self.peers.iter() {
+            let peer_id = entry.key().clone();
+            let peer_stats = entry.value().get_stats().await;
+            stats.insert(peer_id, peer_stats);
+        }
+        stats
+    }
+
+    pub async fn health_check_all_peers(&self) {
+        let mut unhealthy_peers = Vec::new();
+
+        for entry in self.peers.iter() {
+            let peer_id = entry.key().clone();
+            let peer = entry.value();
+
+            if !peer.health_check().await {
+                unhealthy_peers.push(peer_id);
+            }
+        }
+
+        // Remove unhealthy peers
+        for peer_id in unhealthy_peers {
+            self.remove_peer(&peer_id).await;
+        }
+    }
+
+    pub fn start_health_checker(&self) -> tokio::task::JoinHandle<()> {
+        let peer_set = Arc::new(self.peers.clone());
+        let worker_manager = Arc::clone(&self.worker_manager);
+        let health_check_interval = self.config.health_check_interval;
+
+        tokio::spawn(async move {
+            let mut interval = interval(health_check_interval);
+
+            loop {
+                interval.tick().await;
+
+                let mut unhealthy_peers = Vec::new();
+
+                for entry in peer_set.iter() {
+                    let peer_id = entry.key().clone();
+                    let peer = entry.value();
+
+                    if !peer.health_check().await {
+                        unhealthy_peers.push(peer_id);
+                    }
+                }
+
+                // Remove unhealthy peers
+                for peer_id in unhealthy_peers {
+                    peer_set.remove(&peer_id);
+                    worker_manager.stop_worker(&peer_id).await;
+
+                    let _ = store::sqlite::peer::set_peer_disconnected(
+                        store::get_db_path().as_str(),
+                        &peer_id,
+                    );
+                }
+            }
+        })
+    }
+
+    pub async fn get_best_peers(&self, count: usize) -> Vec<AsyncPeer> {
+        let mut peers_with_scores = Vec::new();
+
+        for entry in self.peers.iter() {
+            if entry.value().is_connected() {
+                let score = entry.value().calculate_score().await;
+                peers_with_scores.push((entry.value().clone(), score));
+            }
+        }
+
+        // Sort by score (descending)
+        peers_with_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        peers_with_scores
+            .into_iter()
+            .take(count)
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    pub async fn reconnect_peer(&self, peer_id: &str) -> NetworkResult<()> {
+        if let Some(entry) = self.peers.get(peer_id) {
+            let peer = entry.value().clone();
+
+            if peer.health_check().await {
+                // Restart worker if health check passes
+                self.worker_manager
+                    .start_worker(peer_id, peer, self.request_sender.subscribe())
+                    .await;
+                Ok(())
+            } else {
+                Err(NetworkError::ConnectionFailed(
+                    "Health check failed".to_string(),
+                ))
+            }
+        } else {
+            Err(NetworkError::ConnectionFailed("Peer not found".to_string()))
+        }
+    }
+}
+
+// Compatibility wrapper for the old synchronous PeerSet
+use std::sync::Mutex;
+
+pub struct PeerSet {
+    async_peer_set: Arc<AsyncPeerSet>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    request_matcher: Arc<Mutex<HashMap<u32, QubicApiPacket>>>,
+    req_channel: (spmc::Sender<QubicApiPacket>, spmc::Receiver<QubicApiPacket>),
+    threads: HashMap<String, std::thread::JoinHandle<()>>,
+}
 
 impl PeerSet {
     pub fn new() -> Self {
-        let _channel = std::sync::mpsc::channel::<QubicApiPacket>();
-        let peer_set = PeerSet {
-            peers: vec![],
-            threads: HashMap::new(),
+        let runtime = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
+        let config = PeerSetConfig::default();
+        let async_peer_set = Arc::new(AsyncPeerSet::new(config));
+
+        Self {
+            async_peer_set,
+            runtime,
             request_matcher: Arc::new(Mutex::new(HashMap::new())),
             req_channel: spmc::channel::<QubicApiPacket>(),
-        };
-        peer_set
-    }
-    pub fn get_peers(&self) -> Vec<&Peer> { self.peers.iter().map(|x| x).collect() }
-    pub fn get_peer_ids(&self) -> Vec<String> { self.peers.iter().map(|x| x.get_id().to_owned()).collect() }
-    pub fn num_peers(&self) -> usize {
-        self.peers.len()
-    }
-    pub fn add_peer(&mut self, ip: &str) -> Result<(), String> {
-        if let Ok(max_peers) = std::env::var("RUBIC_MAX_PEERS") {
-            if self.get_peers().len() >= max_peers.parse::<usize>().unwrap() {
-                return Err("Already At Max Capacity of Connected Peers".to_string());
-            }
-        } else {
-            //Don't worry about max peers
-        }
-        for peer in &self.get_peers() {
-            if peer.get_ip_addr() == ip {
-                return Err("Duplicate Peer".to_string());
-            }
-        }
-        let sock: SocketAddr = ip.parse().unwrap();
-        match TcpStream::connect_timeout(&sock, Duration::from_millis(5000)) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(Duration::from_millis(2500))).expect("set_write_timeout call failed");
-                stream.set_write_timeout(Some(Duration::from_millis(2500))).expect("set_write_timeout call failed");
-                stream.set_nodelay(true).expect("set_nodelay call failed");
-                stream.set_ttl(100).expect("set_ttl call failed");
-                let new_peer = Peer::new(ip, None, "");
-                let request_matcher = Arc::clone(&self.request_matcher);
-                let id = new_peer.get_id().to_owned();
-                {
-                    let mut peer = new_peer.clone();
-                    peer.set_stream(stream);
-                    let rx = self.req_channel.1.clone();
-                    let id = id.clone();
-                    let copied_id = id.to_owned();
-                    let t = std::thread::spawn(move || worker::handle_new_peer(id.to_owned(), request_matcher, peer, rx));
-                    self.threads.insert(copied_id, t);
-                }
-                self.peers.push(new_peer);
-                match store::sqlite::peer::set_peer_connected(
-                    store::get_db_path().as_str(),
-                    id.as_str()
-                ) {
-                    Ok(_) => { debug(format!("Set Peer {} Connected.", id.as_str()).as_str()); },
-                    Err(err) => { debug(format!("Error Setting Peer {} Connected! : {}", id.as_str(), err.as_str()).as_str()); }
-                }
-                Ok(())
-            },
-            Err(err) => {
-                error!("Error Adding Peer <{}>! {}", ip, err.to_string());
-                Err(err.to_string())
-            }
+            threads: HashMap::new(),
         }
     }
 
-    pub fn delete_peer(&mut self, ip: &str) -> bool {
-        for (index, connection) in self.peers.iter_mut().enumerate() {
-            if let Some(stream) = &mut connection.get_stream() {
-                match stream.peer_addr() {
-                    Ok(conn) => {
-                        if Ok(conn) == ip.parse() {
-                            self.peers.remove(index);
-                            return true;
-                        }
-                    },
-                    Err(_) => {}
-                }
+    pub fn get_peers(&self) -> Vec<String> {
+        // Return peer IDs as strings since we can't return references to async peers
+        self.runtime.block_on(async {
+            self.async_peer_set.get_peer_ids().await
+        })
+    }
+
+    pub fn get_peer_ids(&self) -> Vec<String> {
+        self.runtime.block_on(async {
+            self.async_peer_set.get_peer_ids().await
+        })
+    }
+
+    pub fn num_peers(&self) -> usize {
+        self.async_peer_set.peers.len()
+    }
+
+    pub fn add_peer(&mut self, ip: &str) -> Result<(), String> {
+        let addr: std::net::SocketAddr = ip.parse()
+            .map_err(|_| "Invalid IP address format".to_string())?;
+
+        self.runtime.block_on(async {
+            match self.async_peer_set.add_peer(addr, "").await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
             }
-        }
-        false
+        })
     }
 
     pub fn delete_peer_by_id(&mut self, id: &str) -> bool {
-        //println!("Deleting Peer {}", id);
-        for (index, connection) in self.peers.iter_mut().enumerate() {
-            if connection.get_id().as_str() == id { //this is the peer, disconnect its stream
-                if let Some(stream) = &mut connection.get_stream() {
-                    match stream.shutdown(std::net::Shutdown::Both) {
-                        Ok(_) => {},
-                        Err(_) => {}
-                    }
-                }
-                match store::sqlite::peer::set_peer_disconnected(
-                    store::get_db_path().as_str(),
-                    id
-                ) {
-                    Ok(_) => {
-                        //println!("Removed Peer {}", id);
-                        self.peers.remove(index);
-                        return true;
-                    },
-                    Err(err) => {
-                        println!("Error Deleting Peer By Id.({}) : {}", id, err.as_str());
-                    }
-                }
-            }
-        }
-        false
+        self.runtime.block_on(async {
+            self.async_peer_set.remove_peer(id).await
+        })
     }
 
-    fn _send_request_via_stream(&mut self, stream: &mut TcpStream, request: &Vec<u8>) -> Result<(), String> {
-        match stream.write(request.as_slice()) {
-            Ok(_) => {
-                let mut result: [u8; 256] = [0; 256];
-                match stream.read(&mut result) {
-                    Ok(bytes_read) => {
-                        println!("Read {} bytes", bytes_read);
-                        Ok(())
-                    },
-                    Err(e) => {
-                        println!("{}", e.to_string());
-                        Err(e.to_string())
-                    }
-                }
-            },
-            Err(err) =>{
-                println!("Failed To Send Data To Peer!");
-                Err(err.to_string())
+    pub fn make_request(&mut self, request: QubicApiPacket) -> Result<(), String> {
+        self.runtime.block_on(async {
+            match self.async_peer_set.make_request(request).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.to_string()),
             }
-        }
-    }
-
-    pub fn make_request(&mut self, mut request: QubicApiPacket) -> Result<(), String> {
-        if self.num_peers() < 1 {
-            return Err("Cannot send request, 0 peers! Add some!".to_string())
-        }
-        let mut ids_to_delete: Vec<String> = vec![];
-        
-        
-        let spam_all: bool = match request.api_type {
-            api::header::EntityType::RequestCurrentTickInfo => false,
-            api::header::EntityType::RequestedQuorumTick => false,
-            api::header::EntityType::RequestTickData => false,
-            api::header::EntityType::RequestContractFunction => false,
-            api::header::EntityType::RequestAssets => false,
-            _ => true
-        };
-
-        let mut _rand_id: String = "".to_string();
-        let p = self.peers.iter().choose(&mut thread_rng()).unwrap();
-        _rand_id = p.get_id().clone();
-        
-        for (_index, peer) in self.peers.iter().enumerate() {
-            if !spam_all {
-                if peer.get_id() != &_rand_id {
-                    continue;
-                } else {
-                    //println!("Choosing Random Peer {}!", peer.get_id());
-                }    
-            }
-            
-            match store::sqlite::peer::fetch_peer_by_id(store::get_db_path().as_str(), peer.get_id().as_str()) {
-                Ok(p) => {
-                    let connected = p.get("connected").unwrap() == "1";
-                    if !connected {
-                        ids_to_delete.push(peer.get_id().to_string());
-                        continue;
-                    }
-                },
-                Err(err) => {
-                    println!("err {}", err);
-                }
-            }
-            request.peer = Some(peer.get_id().to_owned());
-
-            match self.req_channel.0.send(request.clone()) {
-                Ok(_) => { 
-                    if !spam_all {
-                        break;
-                    }
-                },
-                Err(err) => {
-                    println!("Failed To Send Request Data To Threads! : {}", err.to_string());
-                }
-            }
-        }
-        for id in ids_to_delete {
-            self.delete_peer_by_id(id.as_str());
-        }
-        Ok(())
-    }
-}
-
-
-
-#[cfg(test)]
-pub mod peer_tests {
-    use crate::peers::PeerSet;
-
-    #[test]
-    fn add_a_peer() {
-        let mut p_set = PeerSet::new();
-        match p_set.add_peer("127.0.0.1:8000") {
-            Ok(_) => {
-                assert_eq!(p_set.num_peers(), 1);
-            },
-            Err(err) => {
-                assert!(err.contains("refused"));
-                assert_eq!(p_set.num_peers(), 0);
-            }
-        }
+        })
     }
 }

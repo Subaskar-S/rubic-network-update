@@ -1,110 +1,231 @@
-use std::collections::HashMap;
-use std::io::Read;
-use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
 use api::header::{EntityType, RequestResponseHeader};
 use api::request::QubicApiPacket;
-use api::response;
 use store::get_db_path;
 use store::sqlite::peer::set_peer_disconnected;
-use crate::peer::Peer;
 
-pub fn qubic_tcp_receive_data (peer: &Peer, requests: Arc<Mutex<HashMap<u32, QubicApiPacket>>>, stream: &TcpStream) {
-    let mut peeked: [u8; 8] = [0; 8];
-    match stream.peek(&mut peeked) {
-        Ok(_) => {
-            let peeked_header: RequestResponseHeader = RequestResponseHeader::from_vec(&peeked.to_vec());
-            match peeked_header.recv_multiple_packets() {
-                true => {
-                    let mut data = recv_qubic_responses_until_end_response(peer, stream, 676);
-                    //println!("Received Multiple Data: {} From Peer {}", data.len(), peer.get_ip_addr());
-                    response::get_formatted_response_from_multiple(requests, &mut data);
-                },
-                false => {
-                    match recv_qubic_response(peer, stream) {
-                        Some(mut data) => response::get_formatted_response(requests, &mut data),
-                        None => {}
-                    }
+use crate::error::{NetworkError, NetworkResult};
+use crate::peer::AsyncPeer;
+
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PACKET_SIZE: usize = 1024 * 1024; // 1MB max packet size for safety
+const MAX_PACKETS_PER_RESPONSE: usize = 1000; // Prevent infinite loops
+
+pub async fn async_qubic_tcp_receive_data(
+    peer: &AsyncPeer,
+    stream: &mut TcpStream,
+) -> NetworkResult<()> {
+    // Try to read the first packet to determine if it's a multi-packet response
+    match recv_single_packet(peer, stream).await {
+        Ok(Some(packet)) => {
+            // Check if this indicates multiple packets are coming
+            if packet.header.recv_multiple_packets() {
+                // We already got the first packet, now get the rest
+                let mut packets = vec![packet];
+                let mut additional_packets = recv_multiple_packets(peer, stream).await?;
+                packets.append(&mut additional_packets);
+
+                // Process multiple packets
+                if !packets.is_empty() {
+                    logger::debug(&format!(
+                        "Received {} packets from peer {}",
+                        packets.len(),
+                        peer.get_id()
+                    ));
                 }
-            };
-            
-        },
-        Err(_) => {}
+            } else {
+                // Single packet response
+                logger::debug(&format!(
+                    "Received single packet from peer {}",
+                    peer.get_id()
+                ));
+            }
+        }
+        Ok(None) => {
+            // No valid packet received
+            logger::debug("No valid packet received");
+        }
+        Err(e) => {
+            // Handle connection errors
+            handle_connection_error(peer, &e).await;
+            return Err(e);
+        }
     }
+
+    Ok(())
 }
 
+async fn recv_single_packet(
+    peer: &AsyncPeer,
+    stream: &mut TcpStream,
+) -> NetworkResult<Option<QubicApiPacket>> {
+    // First read the header
+    let mut header_bytes = [0u8; 8];
 
-fn recv_qubic_response(peer: &Peer, stream: &TcpStream) -> Option<QubicApiPacket> {
-    let mut peeked: [u8; 8] = [0; 8];
-    match stream.peek(&mut peeked) {
-        Ok(_) => {
-            let peeked_header: RequestResponseHeader = RequestResponseHeader::from_vec(&peeked.to_vec());
-            //println!("RESPONSE: {:?}  {:?}, {} bytes", &peeked_header, &peeked_header.get_type(), &peeked_header.get_size());
-            let mut result_size: Vec<u8> = vec![0; peeked_header.get_size()];
-            match stream.try_clone() {  //1 worker thread per tcp stream, should be fine to clone
-                Ok(mut stream) => {
-                    match stream.read_exact(&mut result_size) {
-                        Ok(_) => {
-                            let api_response: Option<QubicApiPacket> = QubicApiPacket::format_response_from_bytes(peer.get_id(), result_size.to_vec());
-                            api_response
-                        },
-                        Err(_err) => {
-                            //eprintln!("Failed To Read Response! : {}", _err.to_string());
-                            None
-                        }
-                    }
-                },
-                Err(_) => {
-                    eprintln!("Failed To Clone TCP Stream");
-                    None
-                }
-            }
-        },
-        Err(_err) => {
-            //println!("Failed To Peek! {}", _err);
-            set_peer_disconnected(get_db_path().as_str(), peer.get_id().as_str()).unwrap();
-            None
+    timeout(READ_TIMEOUT, async {
+        stream
+            .read_exact(&mut header_bytes)
+            .await
+            .map_err(|e| NetworkError::Io(e))
+    })
+    .await
+    .map_err(|_| NetworkError::Timeout)??;
+
+    let header = RequestResponseHeader::from_vec(&header_bytes.to_vec());
+    let packet_size = header.get_size();
+
+    // Validate packet size
+    if packet_size < 8 || packet_size > MAX_PACKET_SIZE {
+        return Err(NetworkError::InvalidResponse);
+    }
+
+    // Read the full packet (including the header we already read)
+    let mut buffer = vec![0u8; packet_size];
+    buffer[0..8].copy_from_slice(&header_bytes);
+
+    if packet_size > 8 {
+        timeout(READ_TIMEOUT, async {
+            stream
+                .read_exact(&mut buffer[8..])
+                .await
+                .map_err(|e| NetworkError::Io(e))
+        })
+        .await
+        .map_err(|_| NetworkError::Timeout)??;
+    }
+
+    match QubicApiPacket::format_response_from_bytes(&peer.get_id().to_string(), buffer) {
+        Some(packet) => Ok(Some(packet)),
+        None => {
+            logger::debug("Failed to parse packet from peer");
+            Err(NetworkError::InvalidResponse)
         }
     }
 }
 
+async fn recv_multiple_packets(
+    peer: &AsyncPeer,
+    stream: &mut TcpStream,
+) -> NetworkResult<Vec<QubicApiPacket>> {
+    let mut packets = Vec::new();
+    let mut packet_count = 0;
 
-fn recv_qubic_responses_until_end_response(peer: &Peer, stream: &TcpStream, max_packets_to_read: u32) -> Vec<QubicApiPacket> {
-    let mut data: Vec<QubicApiPacket> = Vec::new();
-    let mut peeked: [u8; 8] = [0; 8];
-    let mut peeked_header: RequestResponseHeader = RequestResponseHeader::from_vec(&peeked.to_vec());
     loop {
-        match stream.peek(&mut peeked) {
-            Ok(_) => {
-                peeked_header = RequestResponseHeader::from_vec(&peeked.to_vec());
-                if peeked_header.get_type().to_byte() == EntityType::ResponseEnd.to_byte() {
-                    return data;
+        // Safety check to prevent infinite loops
+        if packet_count >= MAX_PACKETS_PER_RESPONSE {
+            logger::debug(&format!(
+                "Reached maximum packet limit ({}) for peer {}",
+                MAX_PACKETS_PER_RESPONSE,
+                peer.get_id()
+            ));
+            break;
+        }
+
+        // Try to read next packet
+        match recv_single_packet(peer, stream).await {
+            Ok(Some(packet)) => {
+                // Check if this is an end response packet
+                if packet.header.get_type().to_byte() == EntityType::ResponseEnd.to_byte() {
+                    break;
                 }
-                peeked = [0; 8];
-                match recv_qubic_response(peer, stream) {
-                    Some(packet) => {
-                        //println!("read multiple packet");
-                        data.push(packet);
-                        if data.len() > max_packets_to_read as usize {
-                            println!("Breaking");
-                            break;
-                        } else {
-                            continue;
-                        }
-                    },
-                    None => {
-                        //eprintln!("Failed To Read Multiple Data");
-                    }
-                }
-                return data;
-            },
-            Err(_err) => {
-                //println!("Failed To Peek! {}", _err);
-                set_peer_disconnected(get_db_path().as_str(), peer.get_id().as_str()).unwrap();
+                packets.push(packet);
+                packet_count += 1;
+            }
+            Ok(None) => {
+                // Invalid packet, but continue trying
+                packet_count += 1;
+                continue;
+            }
+            Err(_) => {
+                // Error reading packet or end of stream, stop
                 break;
             }
         }
     }
-    println!("Read {} Data Packets. Last Packet Type={:?}", &data.len(), peeked_header.get_type());
-    data
+
+    logger::debug(&format!(
+        "Received {} packets from peer {}",
+        packets.len(),
+        peer.get_id()
+    ));
+
+    Ok(packets)
+}
+
+// Enhanced error handling with automatic peer disconnection
+pub async fn handle_connection_error(peer: &AsyncPeer, error: &NetworkError) {
+    match error {
+        NetworkError::ConnectionFailed(_) | NetworkError::Timeout | NetworkError::Io(_) => {
+            // Mark peer as disconnected
+            peer.set_connected(false);
+
+            // Update database
+            if let Err(db_err) = set_peer_disconnected(get_db_path().as_str(), peer.get_id()) {
+                logger::error!(
+                    "Failed to update peer {} disconnect status: {}",
+                    peer.get_id(),
+                    db_err
+                );
+            }
+
+            logger::debug(&format!(
+                "Peer {} disconnected due to: {}",
+                peer.get_id(),
+                error
+            ));
+        }
+        _ => {
+            // Non-connection errors, just log
+            logger::debug(&format!("Peer {} error: {}", peer.get_id(), error));
+        }
+    }
+}
+
+// Utility function for testing connection health
+pub async fn test_connection_health(stream: &mut TcpStream) -> bool {
+    // Try to read 1 byte to test if connection is alive
+    let mut test_byte = [0u8; 1];
+    match timeout(Duration::from_millis(100), async {
+        stream.read(&mut test_byte).await
+    })
+    .await
+    {
+        Ok(Ok(_)) => true,
+        _ => false,
+    }
+}
+
+// Enhanced packet validation
+fn validate_packet_header(header: &RequestResponseHeader) -> NetworkResult<()> {
+    let size = header.get_size();
+
+    // Basic size validation
+    if size < 8 || size > MAX_PACKET_SIZE {
+        return Err(NetworkError::InvalidResponse);
+    }
+
+    // Validate entity type
+    let entity_type = header.get_type();
+    if !is_valid_entity_type(&entity_type) {
+        return Err(NetworkError::InvalidResponse);
+    }
+
+    Ok(())
+}
+
+fn is_valid_entity_type(entity_type: &EntityType) -> bool {
+    matches!(
+        entity_type,
+        EntityType::RequestCurrentTickInfo
+            | EntityType::RespondCurrentTickInfo
+            | EntityType::RequestedQuorumTick
+            | EntityType::RequestTickData
+            | EntityType::RequestContractFunction
+            | EntityType::RequestAssets
+            | EntityType::ResponseEnd // Add other valid types as needed
+    )
 }

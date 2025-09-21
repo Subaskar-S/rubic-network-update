@@ -1,6 +1,5 @@
 use std::str::FromStr;
 use rocket::get;
-use network::peer::Peer;
 use store;
 use crate::env::{get_max_peers, get_min_peers};
 
@@ -17,11 +16,27 @@ pub fn peers() -> String {
 
 #[get("/peers/add/<address>")]
 pub fn add_peer(address: &str) -> String {
-    match std::net::SocketAddrV4::from_str(address) {
+    match std::net::SocketAddr::from_str(address) {
         Ok(_) => {
-            Peer::new(address, None, "");
-            match store::sqlite::peer::fetch_peer_by_ip(store::get_db_path().as_str(), address) {
-                Ok(peer_map) => { peer_map.get(&"id".to_string()).unwrap().clone() },
+            // Add peer to database directly like the original implementation
+            let peer_id = format!("peer_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+            match store::sqlite::peer::create_peer(
+                store::get_db_path().as_str(),
+                &peer_id,
+                address,
+                "",
+                9999,
+                false,
+                std::time::SystemTime::now()
+            ) {
+                Ok(_) => {
+                    match store::sqlite::peer::fetch_peer_by_ip(store::get_db_path().as_str(), address) {
+                        Ok(peer_map) => {
+                            peer_map.get(&"id".to_string()).unwrap_or(&"Unknown".to_string()).clone()
+                        },
+                        Err(_) => { "Failed To Add Peer".to_string() }
+                    }
+                },
                 Err(_) => { "Failed To Add Peer".to_string() }
             }
         },
