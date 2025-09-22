@@ -719,6 +719,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "deranged"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,6 +1548,12 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -2375,11 +2394,17 @@ dependencies = [
  "bytes",
  "chrono",
  "crypto",
+ "dashmap",
  "futures",
+ "futures-util",
  "logger",
  "rand 0.8.5",
+ "socket2 0.5.10",
  "spmc",
  "store",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -3484,7 +3509,7 @@ dependencies = [
 
 [[package]]
 name = "rubic"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "api",
  "base64 0.21.7",
@@ -3497,15 +3522,15 @@ dependencies = [
  "once_cell",
  "protocol",
  "rocket",
- "secrets",
  "smart_contract",
  "spmc",
  "store",
+ "tokio",
 ]
 
 [[package]]
 name = "rubicui"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.21.7",
  "dotenv",
@@ -3646,17 +3671,6 @@ name = "sdd"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
-
-[[package]]
-name = "secrets"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f51745a213c4a2acabad80cd511e40376996bc83db6ceb4ebc7853d41c597988"
-dependencies = [
- "libc",
- "pkg-config",
- "vcpkg",
-]
 
 [[package]]
 name = "selectors"
@@ -4722,6 +4736,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
@@ -5096,12 +5111,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version-compare"
