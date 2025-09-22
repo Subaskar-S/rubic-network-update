@@ -139,21 +139,6 @@ cd frontend && node node_modules/vite/bin/vite.js build
 cd src-tauri && cargo tauri build
 ```
 
-## 📁 Key Files & Locations
-
-### Configuration Files
-- `src-tauri/tauri.conf.json` - Desktop app config
-- `frontend/src/api_config.js` - Backend URL config
-- `frontend/package.json` - Frontend dependencies
-- `Cargo.toml` - Rust dependencies
-
-### Important Directories
-- `target/release/` - Compiled backend binary
-- `frontend/dist/` - Production frontend build
-- `frontend/src/` - React source code
-- `network/src/` - Async network implementation
-- `src-tauri/target/` - Desktop app builds
-
 ### Log Files & Debugging
 - Backend logs: Console output from `rubic.exe`
 - Frontend logs: Browser developer console
@@ -180,13 +165,3 @@ cd src-tauri && cargo tauri build
 ✅ **React Frontend**: Modern UI with Material-UI  
 ✅ **Tauri Desktop**: Cross-platform application  
 ✅ **API Integration**: Full CRUD operations  
-✅ **Build System**: Automated and documented  
-✅ **Documentation**: Complete guides available  
-
-**Status**: Production Ready 🚀
-
----
-
-**Quick Reference for Rubic Wallet v2.0**  
-**Last Updated**: September 2025  
-**Integration**: Complete ✅
